@@ -1,5 +1,3 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-
 {-|
 
 This module provides leak-free and referentially transparent
@@ -22,6 +20,7 @@ module FRP.Elerea.Simple
     , generator
     , memo
     , until
+    , unsafeCacheSignal
     -- * Derived combinators
     , stateful
     , transfer
@@ -47,6 +46,7 @@ import Control.Monad.Fix
 import Data.IORef
 import Data.Maybe
 import Prelude hiding (until)
+import System.IO.Unsafe
 import System.Mem.Weak
 
 -- | A signal represents a value changing over time.  It can be
@@ -67,7 +67,25 @@ import System.Mem.Weak
 -- Signals are constrained to be sampled sequentially, there is no
 -- random access.  The only way to observe their output is through
 -- 'start'.
-newtype Signal a = S (IO a) deriving (Functor, Applicative, Monad)
+newtype Signal a = S (SignalGen (IO a))
+
+instance Functor Signal where
+  fmap f (S gen) = transparentMemo $ S $ fmap (fmap f) gen
+
+instance Applicative Signal where
+  pure x = S (return $ return x)
+  (S f) <*> (S a) = transparentMemo $ S $ (<*>) <$> f <*> a
+
+instance Monad Signal where
+  return = pure
+  (S (SG x)) >>= f = transparentMemo $ S $ SG $ \pool -> do
+    xget <- x pool
+    return $ do
+      xval <- xget
+      case f xval of
+        S (SG y) -> do
+          yget <- y pool
+          yget
 
 -- | A dynamic set of actions to update a network without breaking
 -- consistency.
@@ -135,7 +153,8 @@ start :: SignalGen (Signal a) -- ^ the generator of the top-level signal
       -> IO (IO a)            -- ^ the computation to sample the signal
 start (SG gen) = do
     pool <- newIORef []
-    S sample <- gen pool
+    S (SG sig) <- gen pool
+    sample <- sig pool
     return $ do
         res <- sample
         superstep pool
@@ -173,7 +192,7 @@ addSignal sample update ref pool = do
               Updated x _ -> writeIORef ref $! Ready x
               _           -> error "Signal not updated!"
 
-      sig = S $ readIORef ref >>= \v -> case v of
+      sig = readIORef ref >>= \v -> case v of
               Ready x     -> sample x
               Updated _ x -> return x
       {-# NOINLINE sig #-}
@@ -182,7 +201,10 @@ addSignal sample update ref pool = do
 
   updateActions <- mkWeak sig (upd,fin) Nothing
   modifyIORef pool (updateActions:)
-  return sig
+  return (S $ return sig)
+
+openSig :: IORef UpdatePool -> Signal a -> IO (IO a)
+openSig pool (S (SG x)) = x pool
 
 -- | The 'delay' combinator is the elementary building block for
 -- adding state to the signal network by constructing delayed versions
@@ -224,7 +246,8 @@ addSignal sample update ref pool = do
 delay :: a                    -- ^ initial output at creation time
       -> Signal a             -- ^ the signal to delay
       -> SignalGen (Signal a) -- ^ the delayed signal
-delay x0 (S s) = SG $ \pool -> do
+delay x0 sig = SG $ \pool -> do
+  s <- openSig pool sig
   ref <- newIORef (Ready x0)
 
   let update x = s >>= \x' -> x' `seq` writeIORef ref (Updated x' x)
@@ -238,7 +261,9 @@ delay x0 (S s) = SG $ \pool -> do
 -- the same generator.  In the model, it corresponds to the identity
 -- function.
 snapshot :: Signal a -> SignalGen a
-snapshot (S s) = SG $ \_ -> s
+snapshot sig = SG $ \pool -> do
+  s <- openSig pool sig
+  s
 
 -- | Auxiliary function.
 memoise :: IORef (Phase a) -> a -> IO a
@@ -273,7 +298,8 @@ memoise ref x = writeIORef ref (Updated undefined x) >> return x
 -- used.
 generator :: Signal (SignalGen a) -- ^ the signal of generators to run
           -> SignalGen (Signal a) -- ^ the signal of generated structures
-generator (S s) = SG $ \pool -> do
+generator sig = SG $ \pool -> do
+  s <- openSig pool sig
   ref <- newIORef (Ready undefined)
 
   let sample = (s >>= \(SG g) -> g pool) >>= memoise ref
@@ -295,12 +321,20 @@ generator (S s) = SG $ \pool -> do
 -- All the functions defined in this module return memoised signals.
 memo :: Signal a             -- ^ the signal to cache
      -> SignalGen (Signal a) -- ^ a signal observationally equivalent to the argument
-memo (S s) = SG $ \pool -> do
+memo = return
+
+primMemo :: Signal a             -- ^ the signal to cache
+     -> SignalGen (Signal a) -- ^ a signal observationally equivalent to the argument
+primMemo sig = SG $ \pool -> do
+  s <- openSig pool sig
   ref <- newIORef (Ready undefined)
 
   let sample = s >>= memoise ref
 
   addSignal (const sample) (const (() <$ sample)) ref pool
+
+transparentMemo :: Signal a -> Signal a
+transparentMemo sig = unsafeCacheSignal (primMemo sig)
 
 -- | A signal that is true exactly once: the first time the input
 -- signal is true.  Afterwards, it is constantly false, and it holds
@@ -341,7 +375,8 @@ memo (S s) = SG $ \pool -> do
 -- > [(0,False),(1,False),(2,False),(3,True),(4,False),(5,False)]
 until :: Signal Bool             -- ^ the boolean input signal
       -> SignalGen (Signal Bool) -- ^ a one-shot signal true only the first time the input is true
-until (S s) = SG $ \pool -> do
+until sig = SG $ \pool -> do
+  s <- openSig pool sig
   ref <- newIORef (Ready undefined)
 
   rsmp <- mfix $ \rs -> newIORef $ do
@@ -385,7 +420,7 @@ external :: a                         -- ^ initial value
          -> IO (Signal a, a -> IO ()) -- ^ the signal and an IO function to feed it
 external x = do
   ref <- newIORef x
-  return (S (readIORef ref), writeIORef ref)
+  return (S (return $ readIORef ref), writeIORef ref)
 
 -- | An event-like signal that can be fed through the sink function
 -- returned.  The signal carries a list of values fed in since the
@@ -423,6 +458,27 @@ externalMulti = do
          ,\val -> do vals <- takeMVar var
                      putMVar var (val:vals)
          )
+
+{-# NOINLINE unsafeCacheSignal #-}
+unsafeCacheSignal :: SignalGen (Signal a) -> Signal a
+unsafeCacheSignal (SG gen) = S $ SG $ \pool -> do
+  cache <- readIORef cacheRef
+  case cache of
+    Just s -> return s
+    Nothing -> do
+      sig <- gen pool
+      s <- openSig pool sig
+      writeIORef cacheRef $ Just s
+      return s
+  where
+    cacheRef = unsafeDupablePerformIO $ newIORef (toNothing gen)
+    -- The dupable version is ok here because this thunk cannot
+    -- forced by the user, but only by a network step, which
+    -- happens in a single thread.
+
+{-# NOINLINE toNothing #-}
+toNothing :: a -> Maybe b
+toNothing _ = Nothing
 
 -- | A pure stateful signal.  The initial state is the first output,
 -- and every subsequent state is derived from the preceding one by
@@ -568,7 +624,8 @@ effectful act = SG $ \pool -> do
 effectful1 :: (t -> IO a)          -- ^ the action to be executed repeatedly
            -> Signal t             -- ^ parameter signal
            -> SignalGen (Signal a)
-effectful1 act (S s) = SG $ \pool -> do
+effectful1 act sig = SG $ \pool -> do
+  s <- openSig pool sig
   ref <- newIORef (Ready undefined)
 
   let sample = s >>= act >>= memoise ref
@@ -580,7 +637,9 @@ effectful2 :: (t1 -> t2 -> IO a)   -- ^ the action to be executed repeatedly
            -> Signal t1            -- ^ parameter signal 1
            -> Signal t2            -- ^ parameter signal 2
            -> SignalGen (Signal a)
-effectful2 act (S s1) (S s2) = SG $ \pool -> do
+effectful2 act sig1 sig2 = SG $ \pool -> do
+  s1 <- openSig pool sig1
+  s2 <- openSig pool sig2
   ref <- newIORef (Ready undefined)
 
   let sample = join (liftM2 act s1 s2) >>= memoise ref
@@ -593,7 +652,10 @@ effectful3 :: (t1 -> t2 -> t3 -> IO a) -- ^ the action to be executed repeatedly
            -> Signal t2                -- ^ parameter signal 2
            -> Signal t3                -- ^ parameter signal 3
            -> SignalGen (Signal a)
-effectful3 act (S s1) (S s2) (S s3) = SG $ \pool -> do
+effectful3 act sig1 sig2 sig3 = SG $ \pool -> do
+  s1 <- openSig pool sig1
+  s2 <- openSig pool sig2
+  s3 <- openSig pool sig3
   ref <- newIORef (Ready undefined)
 
   let sample = join (liftM3 act s1 s2 s3) >>= memoise ref
@@ -607,7 +669,11 @@ effectful4 :: (t1 -> t2 -> t3 -> t4 -> IO a) -- ^ the action to be executed repe
            -> Signal t3                      -- ^ parameter signal 3
            -> Signal t4                      -- ^ parameter signal 4
            -> SignalGen (Signal a)
-effectful4 act (S s1) (S s2) (S s3) (S s4) = SG $ \pool -> do
+effectful4 act sig1 sig2 sig3 sig4 = SG $ \pool -> do
+  s1 <- openSig pool sig1
+  s2 <- openSig pool sig2
+  s3 <- openSig pool sig3
+  s4 <- openSig pool sig4
   ref <- newIORef (Ready undefined)
 
   let sample = join (liftM4 act s1 s2 s3 s4) >>= memoise ref
